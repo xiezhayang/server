@@ -1,0 +1,25 @@
+# Go项目忽略规则
+*.exe
+*.test
+*.out
+bin/
+pkg/
+
+# Unity项目忽略规则 - 修正路径
+unityClient/UnityClient/Library/
+unityClient/UnityClient/Temp/
+unityClient/UnityClient/Logs/
+unityClient/UnityClient/UserSettings/
+unityClient/UnityClient/Build/
+unityClient/UnityClient/obj/
+unityClient/UnityClient/*.apk
+unityClient/UnityClient/*.aab
+unityClient/UnityClient/*.app
+unityClient/UnityClient/*.exe
+unityClient/UnityClient/*.dll
+
+# 通用忽略规则
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,38 @@
+# 设置文本文件的换行符
+*.cs text eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.xml text eol=lf
+
+# Unity特定文件
+*.meta text eol=lf
+*.unity text eol=lf
+*.asset text eol=lf
+*.prefab text eol=lf
+
+# 二进制文件不转换
+*.png binary
+*.jpg binary
+*.psd binary
+*.fbx binary
+*.mp3 binary
+*.wav binary
+*.dll binary
+*.exe binary
+
+# 强制所有文本文件使用LF
+* text=auto eol=lf
+*.controller text eol=lf
+*.mat text eol=lf
+*.anim text eol=lf
+*.controller text eol=lf
+*.overrideController text eol=lf
+*.physicMaterial text eol=lf
+*.physicsMaterial2D text eol=lf
+*.guiskin text eol=lf
+*.fontsettings text eol=lf
+*.spriteatlas text eol=lf
