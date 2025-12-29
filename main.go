@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	physicalengine "server/physical-engine"
 	"server/websocketserver"
 
 	"github.com/alecthomas/kingpin/v2"
+	"github.com/jakecoffman/cp/v2"
 )
 
 var (
@@ -23,7 +25,10 @@ var (
 	clientServer = clientCmd.Flag("server", "连接的服务端地址").Default("localhost:8081").Short('s').String()
 	clientName   = clientCmd.Flag("name", "客户端名称").Default("Player1").Short('n').String()
 	clientAuto   = clientCmd.Flag("auto", "自动发送测试消息").Bool()
-
+	// 物理引擎命令
+	physicsCmd     = app.Command("physics", "启动物理引擎")
+	physicsShmName = physicsCmd.Flag("shm", "共享内存名称").Default("UnityGoSharedMemory").String()
+	physicsPort    = physicsCmd.Flag("port", "调试端口").Default("8082").String()
 	// 通用参数（可在任何命令中使用）
 	verbose = app.Flag("verbose", "详细输出").Short('v').Bool()
 )
@@ -42,6 +47,8 @@ func main() {
 		startServer()
 	case clientCmd.FullCommand():
 		startClient()
+	case physicsCmd.FullCommand():
+		startPhysicsEngine()
 	}
 }
 
@@ -69,4 +76,30 @@ func startClient() {
 
 	// 调用客户端初始化
 	websocketserver.WebSocketClientInit(*clientServer, *clientName, *clientAuto)
+}
+
+func startPhysicsEngine() {
+	log.Printf("启动物理引擎模式")
+	log.Printf("共享内存名称: %s", *physicsShmName)
+	log.Printf("调试端口: %s", *physicsPort)
+
+	// 创建物理引擎配置 - 使用正确的字段名
+	config := physicalengine.PhysicsEngineConfig{
+		Gravity:         cp.Vector{X: 0, Y: -9.8},
+		TimeStep:        1.0 / 60.0, // 60 FPS的时间步长
+		Iterations:      10,         // 碰撞迭代次数
+		EnableDebugDraw: true,
+	}
+
+	// 创建共享内存物理引擎
+	engine, err := physicalengine.NewSharedMemoryPhysicsEngine(config, *physicsShmName)
+	if err != nil {
+		log.Fatalf("创建物理引擎失败: %v", err)
+	}
+	defer engine.Close()
+
+	log.Println("物理引擎启动成功，等待Unity连接...")
+
+	// 运行物理引擎
+	engine.Run()
 }
