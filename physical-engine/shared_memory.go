@@ -25,6 +25,23 @@ type SharedMemoryData struct {
 	FrameCounter uint32
 }
 
+type OperationSharedMemoryData struct {
+	PlayerID    uint32  // 玩家ID
+	InputX      float32 // 水平输入 (-1到1)
+	InputY      float32 // 垂直输入 (-1到1)
+	IsJumping   uint32  // 是否跳跃
+	IsConnected uint32  // 是否连接
+}
+
+type PhysicsSharedMemoryData struct {
+	PlayerID     uint32  // 玩家ID
+	PositionX    float32 // X位置
+	PositionY    float32 // Y位置
+	VelocityX    float32 // X速度
+	VelocityY    float32 // Y速度
+	FrameCounter uint32  // 帧计数器
+}
+
 type SharedMemoryManager struct {
 	shmName  string
 	shmSize  int
@@ -32,6 +49,7 @@ type SharedMemoryManager struct {
 	shmPtr   uintptr
 	shmData  *SharedMemoryData
 	isOwner  bool
+	OorP     bool //OperationSharedMemoryData or PhysicsSharedMemoryData
 }
 
 // Windows共享内存常量
@@ -50,11 +68,12 @@ const (
 	INVALID_HANDLE_VALUE = ^syscall.Handle(0)
 )
 
-func NewSharedMemoryManager(name string, size int, create bool) (*SharedMemoryManager, error) {
+func NewSharedMemoryManager(name string, size int, create bool, OorP bool) (*SharedMemoryManager, error) {
 	mgr := &SharedMemoryManager{
 		shmName: name,
 		shmSize: size,
 		isOwner: create,
+		OorP:    OorP,
 	}
 
 	// 转换名称为UTF-16
@@ -136,6 +155,7 @@ func (mgr *SharedMemoryManager) Initialize() {
 }
 
 func (mgr *SharedMemoryManager) ReadInput() (float32, float32, bool) {
+	//log.Printf("ReadInput: %f, %f, %t", mgr.shmData.InputX, mgr.shmData.InputY, mgr.shmData.IsJumping != 0)
 	return mgr.shmData.InputX, mgr.shmData.InputY, mgr.shmData.IsJumping != 0
 }
 
@@ -155,4 +175,10 @@ func (mgr *SharedMemoryManager) Close() {
 		procCloseHandle.Call(uintptr(mgr.hMapFile))
 	}
 	log.Printf("Windows共享内存 %s 已关闭", mgr.shmName)
+}
+
+func (mgr *SharedMemoryManager) ShowSharedMemory() {
+
+	log.Printf("SharedMemoryData: %+v", *mgr.shmData)
+
 }

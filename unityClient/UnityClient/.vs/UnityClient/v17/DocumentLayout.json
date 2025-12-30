@@ -1,12 +1,37 @@
 {
   "Version": 1,
   "WorkspaceRootPath": "C:\\Users\\m1539\\server\\unityClient\\UnityClient\\",
-  "Documents": [],
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{6C9E1067-45D3-8D51-00C4-572C36C1182E}|Assembly-CSharp.csproj|c:\\users\\m1539\\server\\unityclient\\unityclient\\assets\\c#\\physicscontroller.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{6C9E1067-45D3-8D51-00C4-572C36C1182E}|Assembly-CSharp.csproj|solutionrelative:assets\\c#\\physicscontroller.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    }
+  ],
   "DocumentGroupContainers": [
     {
       "Orientation": 0,
       "VerticalTabListWidth": 256,
-      "DocumentGroups": []
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 0,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "PhysicsController.cs",
+              "DocumentMoniker": "C:\\Users\\m1539\\server\\unityClient\\UnityClient\\Assets\\C#\\PhysicsController.cs",
+              "RelativeDocumentMoniker": "Assets\\C#\\PhysicsController.cs",
+              "ToolTip": "C:\\Users\\m1539\\server\\unityClient\\UnityClient\\Assets\\C#\\PhysicsController.cs",
+              "RelativeToolTip": "Assets\\C#\\PhysicsController.cs",
+              "ViewState": "AgIAAL4AAAAAAAAAAAAUwOAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2025-12-30T06:39:08.56Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
     }
   ]
 }

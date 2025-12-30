@@ -439,6 +439,7 @@ func (engine *PhysicsEngine) GetObjectPosition(id string) (float64, float64, boo
 func (engine *PhysicsEngine) ApplyForce(id string, fx, fy float64) bool {
 	obj := engine.GetObject(id)
 	if obj == nil || obj.ObjectType != ObjectTypeDynamic {
+		log.Printf("ApplyForce: 物体不存在或不是动态物体: %s", id)
 		return false
 	}
 
@@ -451,6 +452,7 @@ func (engine *PhysicsEngine) ApplyForce(id string, fx, fy float64) bool {
 func (engine *PhysicsEngine) ApplyImpulse(id string, fx, fy float64) bool {
 	obj := engine.GetObject(id)
 	if obj == nil || obj.ObjectType != ObjectTypeDynamic {
+		log.Printf("ApplyForce: 物体不存在或不是动态物体: %s", id)
 		return false
 	}
 

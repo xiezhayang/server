@@ -2,6 +2,7 @@
 package physicalengine
 
 import (
+	"log"
 	"time"
 )
 
@@ -47,12 +48,8 @@ func (engine *SharedMemoryPhysicsEngine) Run() {
 
 	ticker := time.NewTicker(time.Second / 60) // 60 FPS
 	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			engine.Update()
-		}
+	for range ticker.C {
+		engine.Update()
 	}
 }
 
@@ -81,9 +78,13 @@ func (engine *SharedMemoryPhysicsEngine) Update() {
 		// 获取物理对象位置
 		x, y, _ := engine.physicsEngine.GetObjectPosition("player")
 		vx, vy, _ := engine.physicsEngine.GetObjectVelocity("player")
+		//log.Printf("x: %f, y: %f, vx: %f, vy: %f", x, y, vx, vy)
 
 		// 写入物理数据到共享内存
 		engine.sharedMemory.WritePhysics(float32(x), float32(y), float32(vx), float32(vy))
+		engine.sharedMemory.ShowSharedMemory()
+	} else {
+		log.Printf("playerObject is nil")
 	}
 }
 

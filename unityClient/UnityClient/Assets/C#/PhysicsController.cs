@@ -83,7 +83,11 @@ public class PhysicsController : MonoBehaviour
                 IsConnected = 1u,
                 FrameCounter = 0
             };
-            WriteToSharedMemory();
+            accessor.Write(0, sharedData.PlayerID);
+        accessor.Write(4, sharedData.PositionX);
+        accessor.Write(8, sharedData.PositionY);
+        accessor.Write(32, sharedData.IsConnected);
+        accessor.Write(36, sharedData.FrameCounter);
             Debug.Log($"共享内存 {sharedMemoryName} 初始化成功");
         }
         catch (System.Exception e)
@@ -186,17 +190,46 @@ public class PhysicsController : MonoBehaviour
         }
     }
 
-    void ReadPhysicsFromSharedMemory()
+void ReadPhysicsFromSharedMemory()
+{
+    try
     {
-        try
+        // 使用流式读取，避免缓存问题
+        using (var stream = sharedMemory.CreateViewStream(0, 40))
+        using (var reader = new System.IO.BinaryReader(stream))
         {
-            accessor.Read(0, out sharedData);
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"读取共享内存失败: {e.Message}");
+            // 按照字段顺序读取（与Go结构体完全一致）
+            uint playerID = reader.ReadUInt32();
+            float posX = reader.ReadSingle();
+            float posY = reader.ReadSingle();
+            float velX = reader.ReadSingle();
+            float velY = reader.ReadSingle();
+            float inputX = reader.ReadSingle();
+            float inputY = reader.ReadSingle();
+            uint isJumping = reader.ReadUInt32();
+            uint isConnected = reader.ReadUInt32();
+            uint frameCounter = reader.ReadUInt32();
+            
+            // 更新共享数据
+            sharedData.PlayerID = playerID;
+            sharedData.PositionX = posX;
+            sharedData.PositionY = posY;
+            sharedData.VelocityX = velX;
+            sharedData.VelocityY = velY;
+            sharedData.InputX = inputX;
+            sharedData.InputY = inputY;
+            sharedData.IsJumping = isJumping;
+            sharedData.IsConnected = isConnected;
+            sharedData.FrameCounter = frameCounter;
         }
     }
+    catch (System.Exception e)
+    {
+        Debug.LogError($"读取共享内存失败: {e.Message}");
+    }
+}
+
+
 
     void UpdateTransform()
     {
@@ -243,14 +276,22 @@ public class PhysicsController : MonoBehaviour
 
     void WriteToSharedMemory()
     {
-        try
-        {
-            accessor.Write(0, ref sharedData);
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"写入共享内存失败: {e.Message}");
-        }
+         try
+    {
+        // 只写入输入相关字段，不覆盖位置数据！
+        // InputX 偏移20字节, InputY 偏移24字节, IsJumping 偏移28字节
+        accessor.Write(20, sharedData.InputX);  // 只写InputX
+        accessor.Write(24, sharedData.InputY);  // 只写InputY
+        accessor.Write(28, sharedData.IsJumping); // 只写IsJumping
+        
+        // 保持IsConnected始终为1（只在初始化时设置一次）
+        accessor.Write(32, 1u);
+    }
+    catch (System.Exception e)
+    {
+        Debug.LogError($"写入共享内存失败: {e.Message}");
+    }
+        
     }
 
     // 在Inspector中显示实时信息
