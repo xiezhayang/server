@@ -13,7 +13,7 @@ import (
 
 // Windows共享内存结构体
 type SharedMemoryData struct {
-	PlayerID     [32]byte
+	PlayerID     uint32
 	PositionX    float32
 	PositionY    float32
 	VelocityX    float32
@@ -122,6 +122,7 @@ func NewSharedMemoryManager(name string, size int, create bool) (*SharedMemoryMa
 
 func (mgr *SharedMemoryManager) Initialize() {
 	*mgr.shmData = SharedMemoryData{
+		PlayerID:     1,
 		PositionX:    0,
 		PositionY:    0,
 		VelocityX:    0,
@@ -132,9 +133,6 @@ func (mgr *SharedMemoryManager) Initialize() {
 		IsConnected:  1,
 		FrameCounter: 0,
 	}
-
-	// 复制字符串到字节数组
-	copy(mgr.shmData.PlayerID[:], "unity_player")
 }
 
 func (mgr *SharedMemoryManager) ReadInput() (float32, float32, bool) {
