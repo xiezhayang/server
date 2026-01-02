@@ -13,29 +13,46 @@ import (
 
 // GoUnityConnector 主连接器接口
 type GoUnityConnector struct {
-	config        ConnectorConfig
-	syncManager   *ObjectSyncManager
+	config BidirectionalConnectorConfig
+
+	// 内存块
+	syncBlock *extensiveMemoryBlock // 物理状态同步
+	opBlock   *OperationMemoryBlock // 操作命令传输
+
+	// 状态管理
 	stats         ConnectorStats
 	eventHandlers []EventHandler
 	running       bool
 	stopChan      chan struct{}
 	wg            sync.WaitGroup
 	mu            sync.RWMutex
+
+	// 帧计数器
+	frameCounter uint64
+	frameTimer   *time.Ticker
 }
 
 // ConnectorConfig 连接器配置
-type ConnectorConfig struct {
-	// 同步配置
-	SyncBlockName      string
-	MaxObjects         uint32
-	FrameRate          int // 目标帧率
-	EnableDoubleBuffer bool
+// BidirectionalConnectorConfig 双向连接器配置
+type BidirectionalConnectorConfig struct {
+	// Go->Unity 物理状态同步配置
+	GoToUnity struct {
+		BlockName          string
+		MaxObjects         uint32
+		FrameRate          int // 目标帧率（如60）
+		EnableDoubleBuffer bool
+		FullSyncInterval   int // 完整同步间隔（帧数）
+	}
 
-	// 性能配置
-	FullSyncInterval int // 完整同步间隔（帧数）
-	ChangeThreshold  int // 变化阈值，超过此值触发完整同步
+	// Unity->Go 操作命令配置
+	UnityToGo struct {
+		BlockName   string
+		MaxCommands uint32 // 命令队列容量（如256）
+		PollingRate int    // 轮询频率（如120Hz）
+		EnableLog   bool   // 启用操作日志
+	}
 
-	// 调试配置
+	// 通用配置
 	EnableLogging bool
 	LogInterval   time.Duration
 }
@@ -61,51 +78,55 @@ var DefaultConfig = ConnectorConfig{
 }
 
 // NewGoUnityConnector 创建新的连接器
-func NewGoUnityConnector(config ConnectorConfig) (*GoUnityConnector, error) {
-	if config.SyncBlockName == "" {
-		config.SyncBlockName = DefaultConfig.SyncBlockName
-	}
-	if config.MaxObjects == 0 {
-		config.MaxObjects = DefaultConfig.MaxObjects
-	}
-	if config.FrameRate == 0 {
-		config.FrameRate = DefaultConfig.FrameRate
+// NewBidirectionalConnector 创建双向连接器
+func NewBidirectionalConnector(config BidirectionalConnectorConfig) (*GoUnityConnector, error) {
+	// 创建对象同步内存块
+	syncConfig := extensiveMemoryBlockConfig{
+		Name:               config.GoToUnity.BlockName,
+		MaxObjects:         config.GoToUnity.MaxObjects,
+		EnableDoubleBuffer: config.GoToUnity.EnableDoubleBuffer,
 	}
 
-	// 创建内存块配置
-	memConfig := MemoryBlockConfig{
-		Name:               config.SyncBlockName,
-		MaxObjects:         config.MaxObjects,
-		EnableDoubleBuffer: config.EnableDoubleBuffer,
-		BufferCount:        2,
-	}
-
-	// 创建对象同步管理器
-	syncManager, err := NewObjectSyncManager(memConfig)
+	syncBlock, err := NewExtensiveMemoryBlock(syncConfig, true)
 	if err != nil {
-		return nil, fmt.Errorf("创建同步管理器失败: %v", err)
+		return nil, fmt.Errorf("创建对象同步内存块失败: %v", err)
+	}
+
+	// 创建操作命令内存块
+	opConfig := OperationMemoryBlockConfig{
+		Name:      config.UnityToGo.BlockName,
+		Capacity:  config.UnityToGo.MaxCommands,
+		EnableLog: config.UnityToGo.EnableLog,
+	}
+
+	opBlock, err := NewOperationMemoryBlock(opConfig, true)
+	if err != nil {
+		syncBlock.Close()
+		return nil, fmt.Errorf("创建操作命令内存块失败: %v", err)
 	}
 
 	connector := &GoUnityConnector{
-		config:      config,
-		syncManager: syncManager,
-		stats:       ConnectorStats{},
-		running:     false,
-		stopChan:    make(chan struct{}),
+		config:        config,
+		syncBlock:     syncBlock,
+		opBlock:       opBlock,
+		stats:         ConnectorStats{},
+		running:       false,
+		stopChan:      make(chan struct{}),
+		eventHandlers: make([]EventHandler, 0),
 	}
 
-	// 设置帧完成回调
-	syncManager.SetFrameCompleteCallback(func(frameNum uint64, changedCount int) {
-		connector.updateStats(frameNum, changedCount)
-		connector.notifyFrameSyncComplete(frameNum, changedCount)
-	})
-
-	log.Printf("GoUnityConnector 初始化完成: 内存块=%s, 最大对象=%d",
-		config.SyncBlockName, config.MaxObjects)
+	log.Printf("双向连接器初始化完成:")
+	log.Printf("  同步块: %s (容量: %d 对象, 双缓冲: %v)",
+		config.GoToUnity.BlockName, config.GoToUnity.MaxObjects,
+		config.GoToUnity.EnableDoubleBuffer)
+	log.Printf("  操作块: %s (容量: %d 命令, 轮询: %dHz)",
+		config.UnityToGo.BlockName, config.UnityToGo.MaxCommands,
+		config.UnityToGo.PollingRate)
 
 	return connector, nil
 }
 
+// Start 启动连接器
 // Start 启动连接器
 func (guc *GoUnityConnector) Start() error {
 	guc.mu.Lock()
@@ -118,17 +139,23 @@ func (guc *GoUnityConnector) Start() error {
 	guc.running = true
 	guc.stopChan = make(chan struct{})
 
-	// 启动同步循环
+	// 启动物理同步循环
 	guc.wg.Add(1)
-	go guc.syncLoop()
+	go guc.physicalSyncLoop()
 
-	// 启动统计日志（如果启用）
+	// 启动命令处理循环
+	guc.wg.Add(1)
+	go guc.commandProcessingLoop()
+
+	// 启动统计日志
 	if guc.config.EnableLogging {
 		guc.wg.Add(1)
 		go guc.logStatsLoop()
 	}
 
-	log.Printf("GoUnityConnector 已启动，目标帧率: %d FPS", guc.config.FrameRate)
+	log.Printf("双向连接器已启动")
+	log.Printf("  物理同步: %d FPS", guc.config.GoToUnity.FrameRate)
+	log.Printf("  命令处理: %d Hz", guc.config.UnityToGo.PollingRate)
 
 	return nil
 }
@@ -142,195 +169,158 @@ func (guc *GoUnityConnector) Stop() error {
 		return nil
 	}
 
-	log.Printf("正在停止 GoUnityConnector...")
+	log.Printf("正在停止双向连接器...")
 
 	guc.running = false
 	close(guc.stopChan)
 	guc.wg.Wait()
 
-	// 关闭同步管理器
-	if guc.syncManager != nil {
-		guc.syncManager.Close()
-	}
+	// 关闭内存块
+	guc.syncBlock.Close()
+	guc.opBlock.Close()
 
-	log.Printf("GoUnityConnector 已停止")
-
+	log.Printf("双向连接器已停止")
 	return nil
 }
 
-// syncLoop 同步循环
-func (guc *GoUnityConnector) syncLoop() {
+// Stop 停止连接器
+// physicalSyncLoop 物理状态同步循环
+func (guc *GoUnityConnector) physicalSyncLoop() {
 	defer guc.wg.Done()
 
-	frameDuration := time.Second / time.Duration(guc.config.FrameRate)
-	ticker := time.NewTicker(frameDuration)
-	defer ticker.Stop()
+	frameDuration := time.Second / time.Duration(guc.config.GoToUnity.FrameRate)
+	guc.frameTimer = time.NewTicker(frameDuration)
+	defer guc.frameTimer.Stop()
 
 	for {
 		select {
 		case <-guc.stopChan:
 			return
-		case <-ticker.C:
-			guc.processFrame()
+		case <-guc.frameTimer.C:
+			guc.processPhysicalFrame()
 		}
 	}
 }
 
-// processFrame 处理单帧
-func (guc *GoUnityConnector) processFrame() {
+// processPhysicalFrame 处理物理帧
+func (guc *GoUnityConnector) processPhysicalFrame() {
 	startTime := time.Now()
 
-	// 开始新帧
-	guc.syncManager.BeginFrame()
+	// 从物理引擎获取对象状态（由外部实现）
+	objects, changed := guc.getPhysicalObjects()
 
-	// TODO: 这里可以插入游戏逻辑更新对象状态的代码
-	// 例如：guc.updateGameObjects()
+	// 写入共享内存
+	if len(objects) > 0 && len(changed) > 0 {
+		guc.syncBlock.WriteObjects(objects, changed)
 
-	// 结束帧，执行同步
-	guc.syncManager.EndFrame()
+		// 更新头部信息
+		guc.syncBlock.UpdateHeader(
+			guc.frameCounter,
+			uint32(len(changed)),
+			uint32(len(objects)),
+			0, // 标志位
+		)
 
-	// 更新统计
+		// 双缓冲切换
+		if guc.config.GoToUnity.EnableDoubleBuffer {
+			oldIdx, newIdx := guc.syncBlock.SwapBuffer()
+			if guc.config.EnableLogging {
+				log.Printf("双缓冲切换: %d -> %d (变化对象: %d)",
+					oldIdx, newIdx, len(changed))
+			}
+		}
+
+		// 通知事件处理器
+		guc.notifyFrameSyncComplete(guc.frameCounter, len(changed))
+	}
+
+	guc.frameCounter++
 	guc.stats.LastFrameTime = time.Since(startTime)
 	guc.stats.TotalFrames++
 }
 
-// RegisterObject 注册新对象（对外接口）
-func (guc *GoUnityConnector) RegisterObject(objID uint32, typeID ObjectType, x, y float32) bool {
-	success := guc.syncManager.RegisterObject(objID, typeID, x, y)
-	if success {
-		guc.notifyObjectRegistered(objID, typeID)
-	}
-	return success
-}
-
-// UpdateObject 更新对象状态（对外接口）
-func (guc *GoUnityConnector) UpdateObject(objID uint32, data *ObjectSyncData) bool {
-	return guc.syncManager.UpdateObject(objID, func(obj *ObjectSyncData) {
-		*obj = *data
-	})
-}
-
-// RemoveObject 移除对象（对外接口）
-func (guc *GoUnityConnector) RemoveObject(objID uint32) bool {
-	success := guc.syncManager.RemoveObject(objID)
-	if success {
-		guc.notifyObjectRemoved(objID)
-	}
-	return success
-}
-
-// GetSnapshot 获取当前快照
-func (guc *GoUnityConnector) GetSnapshot() *Snapshot {
-	return guc.syncManager.GetSnapshot()
-}
-
-// AddEventHandler 添加事件处理器
-func (guc *GoUnityConnector) AddEventHandler(handler EventHandler) {
-	guc.mu.Lock()
-	defer guc.mu.Unlock()
-	guc.eventHandlers = append(guc.eventHandlers, handler)
-}
-
-// updateStats 更新统计信息
-func (guc *GoUnityConnector) updateStats(frameNum uint64, changedCount int) {
-	guc.mu.Lock()
-	defer guc.mu.Unlock()
-
-	guc.stats.TotalObjects += uint64(changedCount)
-
-	// 计算平均变化率（滑动窗口）
-	if guc.stats.TotalFrames > 0 {
-		totalFrames := float64(guc.stats.TotalFrames)
-		totalChanges := float64(guc.stats.TotalObjects)
-		guc.stats.AvgChangesPerFrame = totalChanges / totalFrames
-
-		// 估算带宽（假设每个对象28字节）
-		guc.stats.AvgBandwidth = guc.stats.AvgChangesPerFrame * 28.0
-	}
-}
-
-// logStatsLoop 统计日志循环
-func (guc *GoUnityConnector) logStatsLoop() {
+// commandProcessingLoop 命令处理循环
+func (guc *GoUnityConnector) commandProcessingLoop() {
 	defer guc.wg.Done()
 
-	ticker := time.NewTicker(guc.config.LogInterval)
-	defer ticker.Stop()
+	pollDuration := time.Second / time.Duration(guc.config.UnityToGo.PollingRate)
+	pollTimer := time.NewTicker(pollDuration)
+	defer pollTimer.Stop()
 
 	for {
 		select {
 		case <-guc.stopChan:
 			return
-		case <-ticker.C:
-			guc.logStats()
+		case <-pollTimer.C:
+			guc.processCommands()
 		}
 	}
 }
 
-// logStats 输出统计信息
-func (guc *GoUnityConnector) logStats() {
-	guc.mu.RLock()
-	stats := guc.stats
-	running := guc.running
-	guc.mu.RUnlock()
+// processCommands 处理接收到的命令
+func (guc *GoUnityConnector) processCommands() {
+	// 读取所有可用命令
+	commands := guc.opBlock.ReadCommands(0)
 
-	if running {
-		log.Printf("同步统计: 帧=%d, 平均变化=%.1f/帧, 带宽≈%.1f B/帧, 帧时间=%v",
-			stats.TotalFrames, stats.AvgChangesPerFrame,
-			stats.AvgBandwidth, stats.LastFrameTime)
+	if len(commands) > 0 {
+		// 统计更新
+		guc.stats.TotalObjects += uint64(len(commands))
+
+		// 将命令传递给operation handler（由外部实现）
+		guc.handleOperationCommands(commands)
+
+		if guc.config.EnableLogging && len(commands) > 0 {
+			log.Printf("处理 %d 个操作命令", len(commands))
+		}
 	}
 }
 
-// 事件通知方法
-func (guc *GoUnityConnector) notifyObjectRegistered(objID uint32, typeID ObjectType) {
-	guc.mu.RLock()
-	handlers := guc.eventHandlers
-	guc.mu.RUnlock()
-
-	for _, handler := range handlers {
-		handler.OnObjectRegistered(objID, typeID)
-	}
+// WriteObject 写入单个对象状态（供物理引擎调用）
+func (guc *GoUnityConnector) WriteObject(objID uint32, data *ObjectSyncData) bool {
+	return guc.syncBlock.WriteObject(objID, data)
 }
 
-func (guc *GoUnityConnector) notifyObjectUpdated(objID uint32, data *ObjectSyncData) {
-	guc.mu.RLock()
-	handlers := guc.eventHandlers
-	guc.mu.RUnlock()
-
-	for _, handler := range handlers {
-		handler.OnObjectUpdated(objID, data)
-	}
+// WriteObjects 批量写入对象状态
+func (guc *GoUnityConnector) WriteObjects(objects []ObjectSyncData, changed []uint32) {
+	guc.syncBlock.WriteObjects(objects, changed)
 }
 
-func (guc *GoUnityConnector) notifyObjectRemoved(objID uint32) {
-	guc.mu.RLock()
-	handlers := guc.eventHandlers
-	guc.mu.RUnlock()
-
-	for _, handler := range handlers {
-		handler.OnObjectRemoved(objID)
-	}
+// ReadCommands 读取操作命令（供operation handler调用）
+func (guc *GoUnityConnector) ReadCommands(maxCount int) []OperationCommand {
+	return guc.opBlock.ReadCommands(maxCount)
 }
 
-func (guc *GoUnityConnector) notifyFrameSyncComplete(frameNum uint64, changedCount int) {
-	guc.mu.RLock()
-	handlers := guc.eventHandlers
-	guc.mu.RUnlock()
-
-	for _, handler := range handlers {
-		handler.OnFrameSyncComplete(frameNum, changedCount)
-	}
+// WriteCommand 写入操作命令（供Unity端调用，通过C#包装器）
+func (guc *GoUnityConnector) WriteCommand(cmd *OperationCommand) bool {
+	return guc.opBlock.WriteCommand(cmd)
 }
 
-// GetStats 获取统计信息
-func (guc *GoUnityConnector) GetStats() ConnectorStats {
-	guc.mu.RLock()
-	defer guc.mu.RUnlock()
-	return guc.stats
+// SwapBuffer 手动触发双缓冲切换
+func (guc *GoUnityConnector) SwapBuffer() (oldIndex, newIndex int32) {
+	return guc.syncBlock.SwapBuffer()
 }
 
-// IsRunning 检查是否在运行
-func (guc *GoUnityConnector) IsRunning() bool {
-	guc.mu.RLock()
-	defer guc.mu.RUnlock()
-	return guc.running
+// GetSyncStats 获取同步统计信息
+func (guc *GoUnityConnector) GetSyncStats() (writes, bytes uint64) {
+	return guc.syncBlock.GetStats()
+}
+
+// GetOpStats 获取操作统计信息
+func (guc *GoUnityConnector) GetOpStats() (writes, reads, overflow uint64) {
+	return guc.opBlock.GetStats()
+}
+
+// GetAvailableCommandSpace 获取命令缓冲区可用空间
+func (guc *GoUnityConnector) GetAvailableCommandSpace() int {
+	return guc.opBlock.GetAvailableSpace()
+}
+
+// IsCommandBufferFull 检查命令缓冲区是否已满
+func (guc *GoUnityConnector) IsCommandBufferFull() bool {
+	return guc.opBlock.IsFull()
+}
+
+// IsCommandBufferEmpty 检查命令缓冲区是否为空
+func (guc *GoUnityConnector) IsCommandBufferEmpty() bool {
+	return guc.opBlock.IsEmpty()
 }

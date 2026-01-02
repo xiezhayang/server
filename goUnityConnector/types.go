@@ -46,29 +46,33 @@ type ObjectSyncData struct {
 	Rotation   float32          // 旋转角度（弧度）
 	StateFlags ObjectStateFlags // 状态位掩码
 	Animation  AnimationState   // 动画状态
-	// 注意：结构体大小固定为 32 字节，便于内存对齐
 }
 
 // SyncHeader 同步内存块头部
-type SyncHeader struct {
-	Version       uint32   // 协议版本
-	MaxObjects    uint32   // 最大对象容量（固定）
-	FrameNumber   uint64   // 全局物理帧号
-	ChangedCount  uint32   // 本帧变化对象数量
-	TotalCount    uint32   // 总有效对象数量
-	Flags         uint32   // 同步标志位
-	FrontBuffer   uint32   // Unity读取的缓冲区索引（0或1）
-	BackBuffer    uint32   // Go写入的缓冲区索引（0或1）
-	Timestamp     uint64   // 最后更新时间戳（纳秒）
-	NextBlockName [64]byte // 下一个内存块的名称
-	HasNext       uint32   // 是否有下一个块
+type extensiveHeader struct {
+	Version      uint32 // 协议版本
+	MaxObjects   uint32 // 最大对象容量（固定）
+	FrameNumber  uint64 // 全局物理帧号
+	Timestamp    uint64 // 最后更新时间戳（纳秒）
+	ChangedCount uint32 // 本帧变化对象数量
+	TotalObjects uint32 // 总有效对象数量
+	FrontBuffer  uint32 // Unity读取的缓冲区索引（0或1）
+	BackBuffer   uint32 // Go写入的缓冲区索引（0或1）
 }
 
 // MemoryBlockConfig 内存块配置
 type extensiveMemoryBlockConfig struct {
 	Name               string // 共享内存名称
-	MaxObjects         uint32 // 最大对象数量
+	MaxObjects         uint32 // 初始最大对象数量
 	EnableDoubleBuffer bool   // 是否启用双缓冲
+
+	// 扩展策略
+	EnableAutoExtend bool    // 是否启用自动扩展
+	ExtendThreshold  float64 // 扩展触发阈值（0.8 = 80%）
+	ExtendStrategy   string  // 扩展策略："fixed", "percentage", "double"
+	ExtendSize       uint32  // 固定扩展大小（当ExtendStrategy="fixed"时）
+	ExtendPercentage float64 // 百分比扩展（当ExtendStrategy="percentage"时）
+	MaxTotalObjects  uint32  // 最大总对象数限制（0=无限制）
 }
 
 // Snapshot 完整的物理状态快照
@@ -102,13 +106,15 @@ const (
 )
 
 // OperationCommand 操作命令（64字节，内存对齐）
+// OperationCommand 操作命令（64字节，内存对齐）
 type OperationCommand struct {
 	Type      OperationType // 操作类型
 	SourceID  uint32        // 发起者对象ID（如玩家ID）
 	TargetID  uint32        // 目标对象ID（可选，0表示无目标）
 	Params    [8]float32    // 参数数组（可传递方向、强度、坐标等）
 	Timestamp uint64        // 命令时间戳（纳秒）
-	Reserved  [8]byte       // 预留字段，保持64字节对齐
+	Seq       uint32        // 序列号（用于检测撕裂读，由Unity端写入，Go端验证）
+	Reserved  [4]byte       // 剩余预留字段，保持64字节对齐
 }
 
 // OperationHeader 操作内存块头部
