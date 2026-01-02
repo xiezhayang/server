@@ -42,10 +42,12 @@ type extensiveMemoryBlockManager struct {
 	config          extensiveMemoryBlockConfig
 	header          extensiveHeader
 	shmPtr          uintptr
-	blocks          map[uint64]*extensiveMemoryBlock
+	blocks          []*extensiveMemoryBlock
 	currentWriteIdx uint32
 	lock            sync.Mutex
-	nextBlockID     uint64
+	nextExtension   uint64
+	freeList        []uint64
+	nextID          uint64 // 下一个新ID（从未使用过的）
 	// 统计信息
 	stats struct {
 		totalWrites    uint64
@@ -56,9 +58,10 @@ type extensiveMemoryBlockManager struct {
 }
 
 type extensiveMemoryBlock struct {
-	hMapFile    syscall.Handle
-	dataBuffers [2][]ObjectSyncData
-	blockID     uint64 // 块链唯一标识
+	hMapFile     syscall.Handle
+	dataBuffers  [2][]ObjectSyncData
+	blockID      uint64 // 块链唯一标识
+	objectsCount uint32
 }
 
 func validateConfig(config extensiveMemoryBlockConfig) error {
@@ -106,12 +109,23 @@ func NewExtensiveMemoryBlockManager(config extensiveMemoryBlockConfig) (*extensi
 		return nil, fmt.Errorf("请求的内存大小超过限制: %d 字节", maxAllowedSize)
 	}
 	embm := &extensiveMemoryBlockManager{
-		config:          config,
-		header:          extensiveHeader{},
-		blocks:          make(map[uint64]*extensiveMemoryBlock),
+		config: config,
+		header: extensiveHeader{
+			Version:      1,
+			MaxObjects:   config.MaxObjects,
+			FrameNumber:  0,
+			Timestamp:    0,
+			ChangedCount: 0,
+			TotalObjects: 0,
+			FrontBuffer:  0,
+			BackBuffer:   1,
+		},
+		blocks:          make([]*extensiveMemoryBlock, 0),
 		currentWriteIdx: 0,
 		lock:            sync.Mutex{},
-		nextBlockID:     0,
+		nextExtension:   0,
+		freeList:        make([]uint64, 0),
+		nextID:          0,
 		stats: struct {
 			totalWrites    uint64
 			totalBytes     uint64
@@ -137,8 +151,7 @@ func (embm *extensiveMemoryBlockManager) NewExtensiveMemoryBlock(blockID uint64)
 		return fmt.Errorf("MaxObjects must be > 0")
 	}
 	if blockID == 0 {
-		blockID = embm.nextBlockID
-		embm.nextBlockID++
+		blockID = uint64(len(embm.blocks))
 	}
 	// 计算总大小：头部 + 数据缓冲区（单缓冲1个，双缓冲2个）
 	bufferDataSize := uintptr(embm.config.MaxObjects) * objectDataSize
@@ -212,7 +225,8 @@ func (embm *extensiveMemoryBlockManager) NewExtensiveMemoryBlock(blockID uint64)
 		// 单缓冲：缓冲区1设为nil，避免混淆
 		mb.dataBuffers[1] = nil
 	}
-	embm.blocks[blockID] = mb
+	embm.blocks = append(embm.blocks, mb)
+	embm.nextExtension += (uint64(embm.config.MaxObjects) * uint64(embm.config.ExtendThreshold))
 	// 修正日志消息
 	bufferText := "对象"
 	if embm.config.EnableDoubleBuffer {
@@ -313,235 +327,88 @@ func (embm *extensiveMemoryBlockManager) GetFrameNumber() uint64 {
 	return atomic.LoadUint64(&embm.header.FrameNumber)
 }
 
-// 当前实现
-func (mb *extensiveMemoryBlock) GetFrontBufferData() []ObjectSyncData {
-	frontIdx := atomic.LoadUint32(&mb.header.FrontBuffer)
-	return mb.dataBuffers[frontIdx] // ← 单缓冲时若 frontIdx=1 会返回 nil
-}
+// allocateObjectID 分配一个新的或重用的ObjectID
+func (embm *extensiveMemoryBlockManager) allocateObjectID() (uint64, bool) {
+	embm.lock.Lock()
+	defer embm.lock.Unlock()
 
-func (embm *extensiveMemoryBlockManager) allocateObjectID() (uint32, bool) {
-	// 原子获取当前总对象数
-	totalCount := atomic.LoadUint32(&mb.header.TotalCount)
+	var objID uint64
 
-	// 检查当前块是否有空间
-	if totalCount < mb.config.MaxObjects {
-		// 在当前块分配
-		newID := totalCount
-		atomic.AddUint32(&mb.header.TotalCount, 1)
-		return newID, true
-	}
+	// 1. 优先从空闲栈弹出（重用）
+	if len(embm.freeList) > 0 {
+		// 弹出最后一个元素（O(1)）
+		lastIdx := len(embm.freeList) - 1
+		objID = embm.freeList[lastIdx]
+		embm.freeList = embm.freeList[:lastIdx]
 
-	// 当前块已满，需要扩展
-	return mb.extendAndAllocate()
-}
+	} else {
+		// 2. 检查是否需要扩展新块
 
-// getBlockByName 从缓存获取或打开共享内存块
-func getBlockByName(name string) *extensiveMemoryBlock {
-	blockCacheMu.RLock()
-	if block, ok := blockCache[name]; ok {
-		blockCacheMu.RUnlock()
-		return block
-	}
-	blockCacheMu.RUnlock()
-
-	// 打开现有块（非创建者）
-	config := extensiveMemoryBlockConfig{
-		Name:               name,
-		MaxObjects:         0, // 打开时不需要指定大小
-		EnableDoubleBuffer: false,
-		EnableAutoExtend:   false,
-	}
-
-	block, err := NewExtensiveMemoryBlock(config, false)
-	if err != nil {
-		log.Printf("警告: 无法打开块 %s: %v", name, err)
-		return nil
-	}
-
-	blockCacheMu.Lock()
-	blockCache[name] = block
-	blockCacheMu.Unlock()
-
-	return block
-}
-
-// max 返回两个uint32中的较大值
-func max(a, b uint32) uint32 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// calculateTotalCapacity 计算整个块链的总容量
-func (mb *extensiveMemoryBlock) calculateTotalCapacity() uint32 {
-	// 如果当前块是头块且header.MaxObjects已更新为总容量，直接返回
-	if mb.isHeadBlock {
-		if total := atomic.LoadUint32(&mb.header.MaxObjects); total > 0 {
-			return total
-		}
-	}
-
-	// 否则遍历链表计算
-	total := uint32(0)
-	current := mb
-	for current != nil {
-		total += current.config.MaxObjects
-		if current.header.HasNext == 0 {
-			break
-		}
-		// 注意：这里可能递归调用getBlockByName，需要防止循环引用
-		nextName := string(current.header.NextBlockName[:])
-		current = getBlockByName(nextName)
-	}
-	return total
-}
-
-// generateBlockName 生成唯一块名称
-func generateBlockName(baseName string, extensionSize uint32) string {
-	timestamp := time.Now().UnixNano()
-	return fmt.Sprintf("%s_ext_%d_%d", baseName, extensionSize, timestamp)
-}
-
-// cleanupBlockChain 清理整个块链（供Close调用）
-func (mb *extensiveMemoryBlock) cleanupBlockChain() {
-	current := mb
-	for current != nil {
-		nextName := ""
-		if current.header.HasNext == 1 {
-			nextName = string(current.header.NextBlockName[:])
-		}
-
-		// 关闭当前块
-		if current.shmPtr != 0 {
-			procUnmapViewOfFile.Call(current.shmPtr)
-			current.shmPtr = 0
-		}
-		if current.hMapFile != 0 {
-			procCloseHandle.Call(uintptr(current.hMapFile))
-			current.hMapFile = 0
-		}
-
-		// 从缓存移除
-		blockCacheMu.Lock()
-		delete(blockCache, current.config.Name)
-		blockCacheMu.Unlock()
-
-		// 移动到下一块
-		if nextName != "" {
-			current = getBlockByName(nextName)
-		} else {
-			current = nil
-		}
-	}
-}
-
-func (mb *extensiveMemoryBlock) extendAndAllocate() (uint32, bool) {
-	mb.extendLock.Lock()
-	defer mb.extendLock.Unlock()
-
-	currentTotalCapacity := mb.calculateTotalCapacity()
-
-	// 根据配置选择扩展策略
-	var extensionSize uint32
-	switch mb.config.ExtendStrategy {
-	case "fixed":
-		extensionSize = mb.config.ExtendSize
-	case "percentage":
-		extensionSize = uint32(float64(currentTotalCapacity) * mb.config.ExtendPercentage)
-	case "double":
-		extensionSize = currentTotalCapacity
-	default: // "percentage" 作为默认
-		extensionSize = max(currentTotalCapacity/2, 256)
-	}
-
-	// 检查最大限制
-	if mb.config.MaxTotalObjects > 0 && currentTotalCapacity+extensionSize > mb.config.MaxTotalObjects {
-		if currentTotalCapacity >= mb.config.MaxTotalObjects {
-			log.Printf("错误: 已达到最大对象数限制 %d", mb.config.MaxTotalObjects)
-			return 0, false
-		}
-		extensionSize = mb.config.MaxTotalObjects - currentTotalCapacity
-	}
-
-	// 创建新块
-	newConfig := mb.config
-	newConfig.Name = generateBlockName(mb.config.Name, extensionSize)
-	newConfig.MaxObjects = extensionSize
-	newConfig.EnableAutoExtend = mb.config.EnableAutoExtend // 继承自动扩展设置
-
-	newBlock, err := NewExtensiveMemoryBlock(newConfig, true)
-	if err != nil {
-		log.Printf("扩展失败: %v", err)
-		return 0, false
-	}
-
-	// 设置双向链表指针
-	newBlock.prevBlock = mb
-	newBlock.blockChainID = mb.blockChainID
-	newBlock.localBlockIdx = mb.localBlockIdx + 1
-	newBlock.isHeadBlock = false
-
-	// 原子连接块链
-	for {
-		if atomic.CompareAndSwapUint32(&mb.header.HasNext, 0, 1) {
-			// 设置下一块名称
-			copy(mb.header.NextBlockName[:], newConfig.Name)
-			mb.header.NextBlockName[63] = 0 // 确保终止
-
-			// 更新头块的总容量（仅头块存储总容量）
-			if mb.isHeadBlock {
-				newTotalCapacity := currentTotalCapacity + extensionSize
-				atomic.StoreUint32(&mb.header.MaxObjects, newTotalCapacity)
+		if embm.nextID >= embm.nextExtension {
+			if !embm.config.EnableAutoExtend {
+				return 0, false // 容量已满且不允许扩展
 			}
 
-			// 更新统计
-			atomic.AddUint64(&mb.stats.extensions, 1)
-			atomic.StoreUint32(&mb.stats.maxObjectsEver, currentTotalCapacity+extensionSize)
+			// 创建新块
+			if err := embm.NewExtensiveMemoryBlock(0); err != nil {
+				log.Printf("扩展块失败: %v", err)
+				return 0, false
+			}
 
-			// 在新块中分配
-			newID := currentTotalCapacity // 第一个ID是原总容量
-			atomic.AddUint32(&newBlock.header.TotalCount, 1)
-
-			// 缓存新块
-			blockCacheMu.Lock()
-			blockCache[newConfig.Name] = newBlock
-			blockCacheMu.Unlock()
-
-			return newID, true
+			// 更新容量
+			embm.nextExtension = uint64(uint32(len(embm.blocks)) * embm.header.MaxObjects)
 		}
-		// 其他线程已扩展，重试分配
-		return mb.allocateObjectID()
+
+		// 3. 分配全新ID
+		objID = embm.nextID
+		embm.nextID++
 	}
+
+	return objID, true
+}
+
+func (embm *extensiveMemoryBlockManager) locateObject(objID uint64) (targetBlock *extensiveMemoryBlock, localIdx uint64) {
+	localIdx = objID % uint64(embm.header.MaxObjects)
+	return embm.blocks[objID/uint64(embm.header.MaxObjects)], localIdx
 }
 
 // WriteObject 写入单个对象数据（支持扩展块）
-func (mb *extensiveMemoryBlock) WriteObject(objID uint32, data *ObjectSyncData) bool {
+func (embm *extensiveMemoryBlockManager) WriteObject(objID uint64, data *ObjectSyncData) bool {
 	// 定位对象所在的块
-	targetBlock, localIdx := mb.locateObject(objID)
+	if objID == 0 {
+		objid, success := embm.allocateObjectID()
+		if !success {
+			log.Printf("错误: 分配ObjectID失败")
+			return false
+
+		}
+		objID = objid
+	}
+	targetBlock, localIdx := embm.locateObject(objID)
 	if targetBlock == nil {
 		log.Printf("错误: ObjectID %d 超出所有块范围", objID)
 		return false
 	}
 
 	// 获取目标块的当前写入缓冲区
-	writeBuffer := targetBlock.GetCurrentWriteBuffer()
-	if localIdx >= uint32(len(writeBuffer)) {
-		log.Printf("错误: 局部索引 %d 超出缓冲区大小 %d", localIdx, len(writeBuffer))
+	writeBuffer := atomic.LoadUint32(&embm.header.BackBuffer)
+
+	if localIdx >= uint64(len(targetBlock.dataBuffers[writeBuffer])) {
+		log.Printf("错误: 局部索引 %d 超出缓冲区大小 %d", localIdx, len(targetBlock.dataBuffers[writeBuffer]))
 		return false
 	}
 
-	writeBuffer[localIdx] = *data
+	targetBlock.dataBuffers[writeBuffer][localIdx] = *data
 
 	// 更新统计
-	atomic.AddUint64(&mb.stats.totalWrites, 1)
-	atomic.AddUint64(&mb.stats.totalBytes, uint64(objectDataSize))
+	atomic.AddUint64(&embm.stats.totalWrites, 1)
+	atomic.AddUint64(&embm.stats.totalBytes, uint64(objectDataSize))
 
 	return true
 }
 
 // WriteObjects 批量写入对象数据（支持扩展块）
-func (mb *extensiveMemoryBlock) WriteObjects(objects []ObjectSyncData, changed []uint32) {
+func (embm *extensiveMemoryBlockManager) WriteObjects(objects []ObjectSyncData, changed []uint64) {
 	if len(objects) == 0 || len(changed) == 0 {
 		return
 	}
@@ -553,23 +420,15 @@ func (mb *extensiveMemoryBlock) WriteObjects(objects []ObjectSyncData, changed [
 			break
 		}
 
-		// 定位对象所在的块
-		targetBlock, localIdx := mb.locateObject(objID)
-		if targetBlock == nil {
-			continue // 跳过无效ID
+		if !embm.WriteObject(objID, &objects[i]) {
+			log.Printf("错误: 写入对象 %d 失败", objID)
+			continue
 		}
-
-		writeBuffer := targetBlock.GetCurrentWriteBuffer()
-		if localIdx >= uint32(len(writeBuffer)) {
-			continue // 跳过无效索引
-		}
-
-		writeBuffer[localIdx] = objects[i]
 		actualWrites++
 	}
 
 	if actualWrites > 0 {
-		atomic.AddUint64(&mb.stats.totalWrites, uint64(actualWrites))
-		atomic.AddUint64(&mb.stats.totalBytes, uint64(actualWrites)*uint64(objectDataSize))
+		atomic.AddUint64(&embm.stats.totalWrites, uint64(actualWrites))
+		atomic.AddUint64(&embm.stats.totalBytes, uint64(actualWrites)*uint64(objectDataSize))
 	}
 }
