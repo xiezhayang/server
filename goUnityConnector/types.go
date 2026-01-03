@@ -83,15 +83,6 @@ type Snapshot struct {
 	Changed     []uint32 // 变化对象的ObjectID列表
 }
 
-// ConnectorStats 连接器统计信息
-type ConnectorStats struct {
-	TotalFrames        uint64
-	TotalObjects       uint64
-	AvgChangesPerFrame float64
-	AvgBandwidth       float64 // 字节/帧
-	LastFrameTime      time.Duration
-}
-
 // OperationType 操作类型枚举
 type OperationType uint32
 
@@ -108,25 +99,19 @@ const (
 // OperationCommand 操作命令（64字节，内存对齐）
 // OperationCommand 操作命令（64字节，内存对齐）
 type OperationCommand struct {
-	Type      OperationType // 操作类型
-	SourceID  uint32        // 发起者对象ID（如玩家ID）
-	TargetID  uint32        // 目标对象ID（可选，0表示无目标）
-	Params    [8]float32    // 参数数组（可传递方向、强度、坐标等）
-	Timestamp uint64        // 命令时间戳（纳秒）
-	Seq       uint32        // 序列号（用于检测撕裂读，由Unity端写入，Go端验证）
-	Reserved  [4]byte       // 剩余预留字段，保持64字节对齐
+	Type     uint32  // 操作类型 (OperationType)
+	SourceID uint32  // 发起者对象ID
+	TargetID uint32  // 目标对象ID（0表示无目标）
+	Param    float32 // 参数（强度、方向等）
+	Seq      uint32  // 序列号（生产者分配，单调递增）
 }
 
 // OperationHeader 操作内存块头部
 type OperationHeader struct {
-	Version    uint32   // 协议版本
-	Capacity   uint32   // 最大命令容量（固定）
-	ReadIndex  uint32   // 读指针（Go读取位置）
-	WriteIndex uint32   // 写指针（Unity写入位置）
-	Count      uint32   // 当前缓冲区中的命令数量
-	Flags      uint32   // 状态标志位
-	Timestamp  uint64   // 最后更新时间戳
-	Padding    [40]byte // 填充到64字节，便于对齐
+	Capacity   uint32 // 环形缓冲区容量（固定）
+	ReadIndex  uint32 // 消费者读位置（Go端）
+	WriteIndex uint32 // 生产者写位置（Unity端）
+	MaxSeq     uint32 // 生产者写入的最新序列号（用于检测32位环绕）
 }
 
 // OperationMemoryBlockConfig 操作内存块配置
@@ -134,4 +119,53 @@ type OperationMemoryBlockConfig struct {
 	Name      string // 共享内存名称
 	Capacity  uint32 // 最大命令数量（建议256-1024）
 	EnableLog bool   // 是否启用日志
+}
+
+type ConnectorConfig struct {
+	// 物理状态同步配置
+	SyncConfig extensiveMemoryBlockConfig
+	FrameRate  uint32 // 物理同步帧率（FPS）
+
+	// 操作命令配置
+	OpConfig    OperationMemoryBlockConfig
+	PollingRate uint32 // 命令轮询频率（Hz）
+
+	// 通用配置
+	EnableLogging bool
+	LogInterval   time.Duration
+}
+
+// PhysicalObjectProvider 物理对象提供者接口
+type PhysicalObjectProvider interface {
+	// GetObjects 获取当前物理对象状态
+	// 返回：对象列表，变化对象ID列表
+	GetObjects() ([]ObjectSyncData, []uint64)
+}
+
+// OperationCommandHandler 操作命令处理器接口
+type OperationCommandHandler interface {
+	// HandleCommands 处理从Unity接收的操作命令
+	HandleCommands([]OperationCommand) error
+}
+
+// ConnectorStats 连接器统计信息
+type ConnectorStats struct {
+	TotalFrames          uint64
+	TotalCommands        uint64
+	AvgFrameTime         time.Duration
+	AvgCommandLatency    time.Duration
+	LastSyncTimestamp    time.Time
+	LastCommandTimestamp time.Time
+}
+
+// DefaultConnectorConfig 连接器默认配置
+var DefaultConnectorConfig = ConnectorConfig{
+	SyncConfig: extensiveDefaultConfig,
+	FrameRate:  60, // 默认60FPS物理同步
+
+	OpConfig:    operationDefaultConfig,
+	PollingRate: 100, // 默认100Hz命令轮询
+
+	EnableLogging: true,
+	LogInterval:   time.Second * 5,
 }

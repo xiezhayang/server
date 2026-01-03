@@ -24,6 +24,22 @@ var (
 	procMapViewOfFile      = modkernel32.NewProc("MapViewOfFile")
 	procUnmapViewOfFile    = modkernel32.NewProc("UnmapViewOfFile")
 	procCloseHandle        = modkernel32.NewProc("CloseHandle")
+	extensiveDefaultConfig = extensiveMemoryBlockConfig{
+		Name:               "UnityGoObjectSync", // 同步块名称
+		MaxObjects:         256,                 // 最大对象数
+		EnableDoubleBuffer: true,                // 启用双缓冲
+		EnableAutoExtend:   false,               // 通常不启用自动扩展
+		ExtendThreshold:    0.8,                 // 80%阈值
+		ExtendStrategy:     "fixed",             // 固定扩展策略
+		ExtendSize:         256,                 // 每次扩展256个对象
+		ExtendPercentage:   0.5,                 // 50%扩展（如果使用百分比策略）
+		MaxTotalObjects:    0,                   // 无限制
+	}
+	operationDefaultConfig = OperationMemoryBlockConfig{
+		Name:      "UnityGoOperationCommands", // 操作命令块名称
+		Capacity:  512,                        // 建议容量：512个命令
+		EnableLog: true,                       // 启用日志
+	}
 )
 
 const (
@@ -497,6 +513,10 @@ func (embm *extensiveMemoryBlockManager) WriteObject(objID uint64, data *ObjectS
 		}
 		objID = objid
 	}
+	if data == nil {
+		return embm.RemoveObject(objID)
+
+	}
 	embm.objectLocks[objID].Lock()
 	defer embm.objectLocks[objID].Unlock()
 	targetBlock, localIdx := embm.locateObject(objID)
@@ -548,10 +568,8 @@ func (embm *extensiveMemoryBlockManager) RemoveObject(objID uint64) bool {
 	if objID == 0 {
 		return false // ID 0 是保留的，无效
 	}
-
 	embm.objectLocks[objID].Lock()
 	defer embm.objectLocks[objID].Unlock()
-
 	// 2. 定位对象
 	targetBlock, localIdx := embm.locateObject(objID)
 	if targetBlock == nil {

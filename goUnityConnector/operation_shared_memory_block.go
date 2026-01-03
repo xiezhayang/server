@@ -8,23 +8,29 @@ import (
 	"log"
 	"sync/atomic"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
+var (
+	headerSize  = unsafe.Sizeof(OperationHeader{})
+	commandSize = unsafe.Sizeof(OperationCommand{})
+)
+
 type OperationMemoryBlock struct {
-	config   OperationMemoryBlockConfig
-	hMapFile syscall.Handle
-	shmPtr   uintptr
-	header   *OperationHeader
-	commands []OperationCommand // 指向共享内存中的环形缓冲区（仅引用）
-	isOwner  bool               // 是否为创建者（Unity端通常为true）
+	config       OperationMemoryBlockConfig
+	hMapFile     syscall.Handle
+	shmPtr       uintptr
+	header       *OperationHeader
+	commands     []OperationCommand // 指向共享内存中的环形缓冲区（仅引用）
+	isOwner      bool               // 是否为创建者（Unity端通常为true）
+	localReadSeq uint32
 
 	// 统计信息（本地内存，非共享）
 	stats struct {
-		totalReads  uint64 // Go端读取次数
-		totalWrites uint64 // Unity端写入次数（通过监控header.Timestamp变化统计）
-		overflow    uint64 // 缓冲区溢出次数
+		totalReads   uint64 // Go端读取次数
+		totalWrites  uint64 // Unity端写入次数（通过监控header.Timestamp变化统计）
+		overflow     uint64 // 缓冲区溢出次数
+		seqWrapCount uint64
 	}
 }
 
@@ -35,15 +41,17 @@ func NewOperationMemoryBlock(config OperationMemoryBlockConfig, create bool) (*O
 	if config.Capacity == 0 {
 		return nil, fmt.Errorf("Capacity必须>0")
 	}
-
+	if config.Capacity > 0x7FFFFFFF {
+		return nil, fmt.Errorf("Capacity过大，可能导致32位索引溢出")
+	}
 	// 计算总大小：头部 + 环形缓冲区
-	headerSize := unsafe.Sizeof(OperationHeader{})
-	commandSize := unsafe.Sizeof(OperationCommand{})
+
 	totalSize := headerSize + uintptr(config.Capacity)*commandSize
 
 	omb := &OperationMemoryBlock{
-		config:  config,
-		isOwner: create,
+		config:       config,
+		isOwner:      create,
+		localReadSeq: 0,
 	}
 
 	// 转换名称为UTF-16
@@ -131,13 +139,10 @@ func NewOperationMemoryBlock(config OperationMemoryBlockConfig, create bool) (*O
 // Initialize 初始化操作内存块头部（仅由Unity端调用）
 func (omb *OperationMemoryBlock) Initialize() {
 	// 使用原子操作确保跨进程可见性
-	atomic.StoreUint32(&omb.header.Version, 1)
 	atomic.StoreUint32(&omb.header.Capacity, omb.config.Capacity)
 	atomic.StoreUint32(&omb.header.ReadIndex, 0)  // Go读取位置
 	atomic.StoreUint32(&omb.header.WriteIndex, 0) // Unity写入位置
-	atomic.StoreUint32(&omb.header.Count, 0)
-	atomic.StoreUint32(&omb.header.Flags, 0)
-	atomic.StoreUint64(&omb.header.Timestamp, uint64(time.Now().UnixNano()))
+	atomic.StoreUint32(&omb.header.MaxSeq, 0)
 
 	if omb.config.EnableLog {
 		log.Printf("操作内存块 %s 已初始化", omb.config.Name)
@@ -149,56 +154,58 @@ func (omb *OperationMemoryBlock) Initialize() {
 // maxCount = 1: 读取单个命令（替代原ReadSingleCommand）
 // 返回实际读取的命令列表，可能为空
 func (omb *OperationMemoryBlock) ReadCommands(maxCount int) []OperationCommand {
-	// 原子获取当前可读命令数
-	currentCount := atomic.LoadUint32(&omb.header.Count)
-	if currentCount == 0 {
+	// 原子获取当前读写指针
+	readIdx := atomic.LoadUint32(&omb.header.ReadIndex)
+	writeIdx := atomic.LoadUint32(&omb.header.WriteIndex)
+	capacity := atomic.LoadUint32(&omb.header.Capacity)
+
+	// 计算可用命令数（处理索引环绕）
+	var available int
+	if writeIdx >= readIdx {
+		available = int(writeIdx - readIdx)
+	} else {
+		available = int(capacity - readIdx + writeIdx)
+	}
+
+	if available == 0 {
 		return nil
 	}
 
 	// 确定要读取的数量
-	toRead := int(currentCount)
+	toRead := available
 	if maxCount > 0 && maxCount < toRead {
 		toRead = maxCount
 	}
 
-	// 原子获取读指针位置
-	currentRead := atomic.LoadUint32(&omb.header.ReadIndex)
-	capacity := omb.config.Capacity
-
+	// 预分配结果切片（旧格式）
 	results := make([]OperationCommand, 0, toRead)
-	var lastSeq uint32 = 0
-	seqInitialized := false
 	readCount := 0
 
-	// 逐个读取命令并进行序列号验证
+	// 逐个读取命令
 	for i := 0; i < toRead; i++ {
-		index := (currentRead + uint32(i)) % capacity
+		index := (readIdx + uint32(i)) % capacity
 		cmd := omb.commands[index]
 
-		// 序列号连续性验证
-		if seqInitialized {
-			expectedSeq := lastSeq + 1
-
-			// 处理32位环绕：0xFFFFFFFF → 0 为有效环绕
-			if lastSeq == 0xFFFFFFFF && cmd.Seq == 0 {
-				// 有效环绕，继续读取
-			} else if cmd.Seq != expectedSeq {
-				// 序列号不连续，可能发生数据撕裂或乱序
+		// 序列号验证（允许环绕）
+		if omb.localReadSeq != 0 {
+			// 检测序列号环绕：newSeq < oldSeq 且差值较大
+			diff := int32(cmd.Seq - omb.localReadSeq)
+			if diff < 0 && -diff > 0x7FFFFFFF {
+				// 有效环绕
+				atomic.AddUint64(&omb.stats.seqWrapCount, 1)
+			} else if diff != 1 && diff != 0 {
+				// 序列号不连续（可能数据撕裂或丢失）
 				if omb.config.EnableLog {
-					log.Printf("警告: 序列号不连续 at index %d (前序=%d, 期望=%d, 实际=%d)",
-						index, lastSeq, expectedSeq, cmd.Seq)
+					log.Printf("警告: 序列号不连续 at index %d (前序=%d, 实际=%d, 差值=%d)",
+						index, omb.localReadSeq, cmd.Seq, diff)
 				}
-				break // 停止读取后续命令
+				// 继续读取，不中断（简化处理）
 			}
-		} else if cmd.Seq == 0 && omb.config.EnableLog {
-			// 第一个命令且序列号为0（可能未初始化）
-			log.Printf("警告: 读取到Seq=0的命令")
 		}
 
 		results = append(results, cmd)
-		lastSeq = cmd.Seq
 		readCount++
-		seqInitialized = true
+		omb.localReadSeq = cmd.Seq
 	}
 
 	if readCount == 0 {
@@ -206,11 +213,8 @@ func (omb *OperationMemoryBlock) ReadCommands(maxCount int) []OperationCommand {
 	}
 
 	// 原子更新读指针
-	newRead := (currentRead + uint32(readCount)) % capacity
+	newRead := (readIdx + uint32(readCount)) % capacity
 	atomic.StoreUint32(&omb.header.ReadIndex, newRead)
-
-	// 原子减少计数（正确方式）
-	atomic.AddUint32(&omb.header.Count, -uint32(readCount))
 
 	// 更新统计
 	atomic.AddUint64(&omb.stats.totalReads, uint64(readCount))
@@ -224,121 +228,15 @@ func (omb *OperationMemoryBlock) ReadCommands(maxCount int) []OperationCommand {
 	return results
 }
 
-// WriteCommand 写入单个命令（Unity端调用，Go端不应使用）
-// 增强版：包含内存屏障和序列号验证，避免修改调用方数据
-func (omb *OperationMemoryBlock) WriteCommand(cmd *OperationCommand) bool {
-	// Go端调用警告（设计为Unity→Go单向通信）
-	if !omb.isOwner && omb.config.EnableLog {
-		log.Printf("警告: Go端不应调用WriteCommand，OperationMemoryBlock设计为Unity→Go单向通信")
-	}
-
-	currentWrite := atomic.LoadUint32(&omb.header.WriteIndex)
-	currentCount := atomic.LoadUint32(&omb.header.Count)
-
-	// 检查缓冲区是否已满
-	if currentCount >= omb.config.Capacity {
-		atomic.AddUint64(&omb.stats.overflow, 1)
-		if omb.config.EnableLog {
-			log.Printf("操作缓冲区溢出，丢弃命令: %v", cmd.Type)
-		}
-		return false
-	}
-
-	// 创建命令副本，避免修改调用方数据
-	cmdCopy := *cmd
-
-	// 设置时间戳（纳秒精度）
-	cmdCopy.Timestamp = uint64(time.Now().UnixNano())
-
-	// 生成序列号（使用header.Flags作为全局序列号计数器）
-	seq := atomic.AddUint32(&omb.header.Flags, 1)
-	cmdCopy.Seq = seq
-
-	// 写入命令副本到环形缓冲区
-	omb.commands[currentWrite] = cmdCopy
-
-	// 内存屏障：确保命令数据在指针更新前对其他CPU可见
-	atomic.StoreUint32(&omb.header.Flags, seq)
-
-	// 原子更新写指针和计数
-	newWrite := (currentWrite + 1) % omb.config.Capacity
-	atomic.StoreUint32(&omb.header.WriteIndex, newWrite)
-	atomic.AddUint32(&omb.header.Count, 1)
-	atomic.StoreUint64(&omb.header.Timestamp, cmdCopy.Timestamp)
-
-	// 更新统计
-	atomic.AddUint64(&omb.stats.totalWrites, 1)
-
-	if omb.config.EnableLog {
-		log.Printf("写入操作命令: Type=%d, SourceID=%d, Seq=%d",
-			cmdCopy.Type, cmdCopy.SourceID, cmdCopy.Seq)
-	}
-
-	return true
-}
-
-// WriteCommands 批量写入命令（Unity端调用）
-func (omb *OperationMemoryBlock) WriteCommands(cmds []OperationCommand) (successCount int) {
-	available := omb.GetAvailableSpace()
-
-	// 批量写入优化：如果可用空间足够，一次性写入多个
-	if available >= len(cmds) {
-		for i := range cmds {
-			if omb.WriteCommand(&cmds[i]) {
-				successCount++
-			}
-		}
-	} else {
-		// 可用空间不足，只写入能容纳的部分
-		for i := 0; i < available; i++ {
-			if omb.WriteCommand(&cmds[i]) {
-				successCount++
-			}
-		}
-	}
-
-	return successCount
-}
-
-// GetAvailableSpace 获取可用空间（Go端可监控缓冲区状态）
-func (omb *OperationMemoryBlock) GetAvailableSpace() int {
-	currentCount := atomic.LoadUint32(&omb.header.Count)
-	return int(omb.config.Capacity) - int(currentCount)
-}
-
-// IsFull 检查缓冲区是否已满
-func (omb *OperationMemoryBlock) IsFull() bool {
-	return atomic.LoadUint32(&omb.header.Count) >= omb.config.Capacity
-}
-
-// IsEmpty 检查缓冲区是否为空
-func (omb *OperationMemoryBlock) IsEmpty() bool {
-	return atomic.LoadUint32(&omb.header.Count) == 0
-}
-
-// GetWriteRate 估算Unity端写入速率（Go端监控用）
-func (omb *OperationMemoryBlock) GetWriteRate() float64 {
-	// 通过监控header.Timestamp变化估算写入频率
-	// 实际实现需要记录时间窗口内的变化
-	return 0.0 // 占位符，实际需要实现时间窗口统计
-}
-
-// GetStats 获取统计信息
-func (omb *OperationMemoryBlock) GetStats() (reads, writes, overflow uint64) {
-	// 对于Go端，totalWrites统计的是通过header.Timestamp监控到的Unity写入次数
-	// 这是一个估算值，实际准确度取决于监控频率
-	return atomic.LoadUint64(&omb.stats.totalReads),
-		atomic.LoadUint64(&omb.stats.totalWrites),
-		atomic.LoadUint64(&omb.stats.overflow)
-}
-
 // Clear 清空缓冲区（Unity端调用，重置状态）
 func (omb *OperationMemoryBlock) Clear() {
+	// 紧凑头部只有4个字段，重置它们
 	atomic.StoreUint32(&omb.header.ReadIndex, 0)
 	atomic.StoreUint32(&omb.header.WriteIndex, 0)
-	atomic.StoreUint32(&omb.header.Count, 0)
-	atomic.StoreUint32(&omb.header.Flags, 0)
-	atomic.StoreUint64(&omb.header.Timestamp, uint64(time.Now().UnixNano()))
+	atomic.StoreUint32(&omb.header.MaxSeq, 0)
+
+	// 同时重置本地状态
+	omb.localReadSeq = 0
 
 	if omb.config.EnableLog {
 		log.Printf("操作缓冲区已清空")
@@ -357,24 +255,4 @@ func (omb *OperationMemoryBlock) Close() {
 	}
 
 	log.Printf("操作内存块 %s 已关闭", omb.config.Name)
-}
-
-// GetHealthStatus 获取内存块健康状态（Go端监控用）
-func (omb *OperationMemoryBlock) GetHealthStatus() string {
-	if omb.shmPtr == 0 {
-		return "已关闭"
-	}
-
-	count := atomic.LoadUint32(&omb.header.Count)
-	capacity := omb.config.Capacity
-	utilization := float64(count) / float64(capacity) * 100
-
-	switch {
-	case utilization >= 90:
-		return fmt.Sprintf("警告: 缓冲区接近满载 (%.1f%%)", utilization)
-	case utilization >= 75:
-		return fmt.Sprintf("正常: 缓冲区使用率较高 (%.1f%%)", utilization)
-	default:
-		return fmt.Sprintf("健康: 缓冲区使用率正常 (%.1f%%)", utilization)
-	}
 }
